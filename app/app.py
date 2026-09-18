@@ -15,6 +15,8 @@ import threading
 import joblib
 import urllib.request
 
+
+
 from pathlib import Path
 from scipy.signal import find_peaks
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
@@ -24,6 +26,7 @@ from mediapipe.tasks.python import vision
 
 import sys
 from pathlib import Path
+
 
 # Add project root to path if needed so scr is importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +43,10 @@ from scr.db import (
 
 # Initialize tables on app launch
 init_db()
+
+from PIL import Image
+from scr.xray_inference import predict_xray
+
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -394,7 +401,7 @@ def calculate_features(left_angles, right_angles, timestamps):
 # WEBRTC VIDEO PROCESSOR
 # ============================================================
 
-class VideoProcessor:
+class VideoProcessor(VideoProcessorBase):
 
     def __init__(self):
         self.start_time = None
@@ -1172,7 +1179,7 @@ else:
 
         # Stop the WebRTC stream.
         try:
-            ctx.stop()
+            getattr(ctx, "stop", lambda: None)()
         except Exception:
             pass
 
@@ -1394,15 +1401,16 @@ elif st.session_state.screening_result is None:
               st.session_state.patient_id = patient_id
 
             if not st.session_state.get("visit_logged", False):
-              log_screening_visit(
-                  patient_id=patient_id,
-                  kinematics=features_dict,
-                  questionnaire=features_dict,
-                  risk=risk,
-                  probabilities=probability_dict,
-                  notes="Automated clinical screening triage",
-              )
-              st.session_state.visit_logged = True
+                visit_id = log_screening_visit(
+                patient_id=patient_id,
+                kinematics=features_dict,
+                questionnaire=features_dict,
+                risk=risk,
+                probabilities=probability_dict,
+                notes="Automated clinical screening triage",
+                )
+                st.session_state.current_visit_id = visit_id
+                st.session_state.visit_logged = True
             # Do not call st.rerun() here. The current run continues directly
             # into Step 5, so the result appears immediately.
 
@@ -1624,3 +1632,101 @@ It does **not diagnose osteoarthritis**.
 st.caption(
     "KneeSense NER • SIH26004 • Prototype"
 )
+
+
+# ============================================================
+# 6. RADIOGRAPHIC EVALUATION (OPTIONAL X-RAY)
+# ============================================================
+st.markdown("---")
+st.header("6️⃣ Radiographic Evaluation (Optional Knee X-Ray)")
+
+st.write(
+    "Upload a standard anterior-posterior (AP) knee radiograph to complement "
+    "functional gait analysis with deep-learning structural joint evaluation."
+)
+
+uploaded_xray = st.file_uploader(
+    "Upload Knee Radiograph",
+    type=["png", "jpg", "jpeg"],
+    key="xray_uploader",
+)
+
+if uploaded_xray is not None:
+  col_img, col_diag = st.columns([1, 1])
+
+  xray_image = Image.open(uploaded_xray)
+
+  with col_img:
+    st.image(
+        xray_image,
+        caption="Uploaded Anterior-Posterior Radiograph",
+        use_container_width=True,
+    )
+
+  with col_diag:
+    with st.spinner("Analyzing joint space and osteophyte presence..."):
+      pred_label, confidence, prob_dict = predict_xray(xray_image)
+        
+
+    if pred_label == "Osteoarthritis":
+      st.error(f"### Radiographic Finding: **{pred_label}**")
+      st.write(f"**Structural Confidence:** `{confidence:.1f}%`")
+    else:
+      st.success(f"### Radiographic Finding: **{pred_label}**")
+      st.write(f"**Structural Confidence:** `{confidence:.1f}%`")
+
+    st.write("**Probability Distribution:**")
+    st.progress(prob_dict.get("Osteoarthritis", 0.0) / 100.0)
+    st.caption(
+        f"Normal: {prob_dict.get('Normal', 0.0):.1f}% | Osteoarthritis:"
+        f" {prob_dict.get('Osteoarthritis', 0.0):.1f}%"
+    )
+
+    # --------------------------------------------------------
+    # MULTIMODAL CLINICAL FUSION
+    # --------------------------------------------------------
+    st.markdown("#### 🔬 Multimodal Clinical Synthesis")
+    screening_res = st.session_state.get("screening_result")
+    movement_risk = (
+        screening_res.get("risk") if isinstance(screening_res, dict) else None
+    )
+
+    if movement_risk:
+      if pred_label == "Osteoarthritis" and movement_risk in [
+          "MODERATE",
+          "HIGH",
+      ]:
+        st.warning(
+            "⚠️ **High Clinical Concordance:** Both biomechanical gait"
+            " asymmetry and structural radiographic joint space changes confirm"
+            " elevated risk markers. Orthopedic consultation strongly"
+            " recommended."
+        )
+      elif (
+          pred_label == "Osteoarthritis"
+          and movement_risk == "LOW"
+      ):
+        st.info(
+            "ℹ️ **Subclinical / Early Structural Changes:** Radiograph"
+            " indicates early joint degeneration despite preserved functional"
+            " range of motion. Early physical therapy intervention indicated."
+        )
+      elif pred_label == "Normal" and movement_risk in [
+          "MODERATE",
+          "HIGH",
+      ]:
+        st.info(
+            "ℹ️ **Symptomatic / Non-Structural Markers:** Functional gait"
+            " limitation observed without overt radiographic changes. Consider"
+            " soft-tissue, ligament, or patellofemoral strain evaluation."
+        )
+      else:
+        st.success(
+            "✅ **Low Risk / Congruent Normal:** Normal functional kinematics"
+            " corroborated by preserved joint space architecture."
+        )
+    else:
+      st.caption(
+          "Complete Steps 1–5 above to generate a combined functional +"
+          " radiographic triage report."
+      )

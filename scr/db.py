@@ -66,9 +66,28 @@ def init_db():
                 prob_high REAL,
                 clinical_notes TEXT,
                 
+                -- Radiographic Findings
+                xray_finding TEXT DEFAULT NULL,
+                xray_confidence REAL DEFAULT NULL,
+
                 FOREIGN KEY (patient_id) REFERENCES patients(patient_id) ON DELETE CASCADE
             );
         """)
+
+    # Safe migration: ensure existing databases get the two new columns
+    cursor.execute("PRAGMA table_info(screening_visits);")
+    existing_cols = [row[1] for row in cursor.fetchall()]
+
+    if "xray_finding" not in existing_cols:
+      cursor.execute(
+          "ALTER TABLE screening_visits ADD COLUMN xray_finding TEXT DEFAULT"
+          " NULL;"
+      )
+    if "xray_confidence" not in existing_cols:
+      cursor.execute(
+          "ALTER TABLE screening_visits ADD COLUMN xray_confidence REAL DEFAULT"
+          " NULL;"
+      )
     conn.commit()
 
 
@@ -119,8 +138,8 @@ def log_screening_visit(
     risk: str,
     probabilities: dict,
     notes: str = "",
-):
-  """Atomically records a screening session into screening_visits."""
+) -> int:
+  """Atomically records a screening session into screening_visits and returns visit_id."""
   with get_connection() as conn:
     cursor = conn.cursor()
     cursor.execute(
@@ -160,8 +179,9 @@ def log_screening_visit(
             notes,
         ),
     )
+    visit_id = cursor.lastrowid
     conn.commit()
-
+    return int(visit_id) if visit_id is not None else 0
 
 def get_patient_history(patient_id: str) -> pd.DataFrame:
   """Retrieves all past visits for a specific patient as a DataFrame."""
@@ -179,3 +199,20 @@ def get_patient_history(patient_id: str) -> pd.DataFrame:
 if __name__ == "__main__":
   init_db()
   print(f"Database initialized at {DB_PATH}")
+
+
+def update_visit_xray(
+    visit_id: int, xray_finding: str, xray_confidence: float
+) -> None:
+  """Updates an existing visit record with radiographic analysis findings."""
+  with get_connection() as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+            UPDATE screening_visits
+            SET xray_finding = ?, xray_confidence = ?
+            WHERE visit_id = ?;
+        """,
+        (xray_finding, float(xray_confidence), int(visit_id)),
+    )
+    conn.commit()
