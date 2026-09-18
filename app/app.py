@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from scipy.signal import find_peaks
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-
+from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -476,7 +476,7 @@ class VideoProcessor:
         if results.pose_landmarks and len(results.pose_landmarks) > 0:
             lm = results.pose_landmarks[0] 
 
-            # Map the new coordinate array (23-28 are hips to ankles)
+            # Map the coordinate array (23-28 are hips to ankles)
             lh, lk, la = lm[23], lm[25], lm[27]
             rh, rk, ra = lm[24], lm[26], lm[28]
 
@@ -514,12 +514,12 @@ class VideoProcessor:
                     (24, 26), (26, 28), (28, 30), (30, 32), (28, 32),
                 ]
 
-                # Map visible landmarks to pixel coordinates
+                # Map visible landmarks to pixel coordinates using 'lm'
                 pts = {}
-                for idx, lm in enumerate(landmarks):
-                    vis = getattr(lm, "visibility", 1.0)
-                    if vis > 0.5:
-                        pts[idx] = (int(lm.x * w), int(lm.y * h))
+                for idx, pt in enumerate(lm):
+                    vis = getattr(pt, "visibility", 1.0)
+                    if vis > 0.4:
+                        pts[idx] = (int(pt.x * w), int(pt.y * h))
 
                 # 1. Draw full body skeleton lines (Sleek clinic silver)
                 for start_idx, end_idx in POSE_CONNECTIONS:
@@ -616,8 +616,6 @@ class VideoProcessor:
             image,
             format="bgr24"
         )
-
-
 # ============================================================
 # MOVEMENT REPORT
 # ============================================================

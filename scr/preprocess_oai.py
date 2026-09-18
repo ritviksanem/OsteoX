@@ -48,11 +48,14 @@ merged["risk"] = merged["kl_grade"].apply(assign_risk)
 
 # 4. Questionnaire normalizations into OsteoX schema
 # Invert KOOS (100 = asymptomatic -> 0; 0 = extreme pain -> 10)
-merged["pain"] = np.clip(
-    np.round((100.0 - pd.to_numeric(merged["KOOS PAIN SCORE"], errors="coerce")) / 10.0),
-    0,
-    10,
-).fillna(0).astype(int)
+# After (Native Pandas Series methods)
+merged["pain"] = (
+    ((100.0 - pd.to_numeric(merged["KOOS PAIN SCORE"], errors="coerce")) / 10.0)
+    .round()
+    .clip(lower=0, upper=10)
+    .fillna(0)
+    .astype(int)
+)
 
 merged["age"] = pd.to_numeric(merged["AGE"], errors="coerce").fillna(50).astype(int)
 merged["sex"] = merged["SIDE"].map({"LEFT": 1, "RIGHT": 0}).astype(int)
