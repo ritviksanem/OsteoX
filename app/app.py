@@ -22,6 +22,24 @@ from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
+import sys
+from pathlib import Path
+
+# Add project root to path if needed so scr is importable
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+  sys.path.append(str(PROJECT_ROOT))
+
+from scr.db import (
+    get_all_patients,
+    get_patient_history,
+    init_db,
+    log_screening_visit,
+    register_patient,
+)
+
+# Initialize tables on app launch
+init_db()
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -33,6 +51,13 @@ st.set_page_config(
     layout="wide"
 )
 
+#Ensure Session State Tracking
+if "current_patient_id" not in st.session_state:
+  st.session_state["current_patient_id"] = None
+if "current_patient_name" not in st.session_state:
+  st.session_state["current_patient_name"] = "Unknown"
+if "visit_logged" not in st.session_state:
+  st.session_state["visit_logged"] = False
 
 # ============================================================
 # PROJECT PATHS
@@ -51,9 +76,12 @@ MODEL_FOLDER.mkdir(parents=True, exist_ok=True)
 
 QUESTIONNAIRE_FILE = FEATURE_FOLDER / "questionnaire_features.csv"
 WALKING_FEATURE_FILE = PROCESSED_FOLDER / "walking_features.csv"
-SCREENING_FILE = PROCESSED_FOLDER / "screening_records.csv"
+#SCREENING_FILE = PROCESSED_FOLDER / "screening_records.csv"
 MODEL_FILE = MODEL_FOLDER / "oa_risk_model.pkl"
 
+from scr.db import get_all_patients, get_patient_history, init_db, log_screening_visit, register_patient
+
+init_db()
 
 # ============================================================
 # SESSION STATE
@@ -89,9 +117,8 @@ KneeSense NER combines **patient symptoms + camera-based pose analysis +
 movement symmetry** to produce a **LOW / MODERATE / HIGH preliminary risk
 category**.
 
-> ⚠️ **Research prototype:** this system does not diagnose osteoarthritis.
-> The current ML model uses synthetic prototype training data and requires
-> clinical validation before medical use.
+> ⚠️ **Research screening prototype**: this system does not provide a definitive diagnosis. 
+>The ML risk model is trained on 8,260 real patient records from the NIH Osteoarthritis Initiative (OAI) dataset for preliminary clinical triage
 """
 )
 
@@ -470,18 +497,47 @@ class VideoProcessor:
                     self.right_angles.append(float(right_angle))
                     self.timestamps.append(float(elapsed))
 
-                # Custom reliable drawing to avoid deprecation errors
+                # Custom reliable full-body wireframe drawing
                 h, w, _ = image.shape
-                left_pts = [(int(pt.x * w), int(pt.y * h)) for pt in [lh, lk, la]]
-                right_pts = [(int(pt.x * w), int(pt.y * h)) for pt in [rh, rk, ra]]
-                
-                for i in range(2):
-                    cv2.line(image, left_pts[i], left_pts[i+1], (0, 255, 0), 3)
-                    cv2.line(image, right_pts[i], right_pts[i+1], (0, 255, 0), 3)
-                    
-                for pt in left_pts + right_pts:
-                    cv2.circle(image, pt, 6, (0, 0, 255), cv2.FILLED)
 
+                # MediaPipe Pose Topology (Torso, Arms, Legs & Feet)
+                POSE_CONNECTIONS = [
+                    # Torso
+                    (11, 12), (11, 23), (12, 24), (23, 24),
+                    # Left Arm
+                    (11, 13), (13, 15),
+                    # Right Arm
+                    (12, 14), (14, 16),
+                    # Left Leg & Foot
+                    (23, 25), (25, 27), (27, 29), (29, 31), (27, 31),
+                    # Right Leg & Foot
+                    (24, 26), (26, 28), (28, 30), (30, 32), (28, 32),
+                ]
+
+                # Map visible landmarks to pixel coordinates
+                pts = {}
+                for idx, lm in enumerate(landmarks):
+                    vis = getattr(lm, "visibility", 1.0)
+                    if vis > 0.5:
+                        pts[idx] = (int(lm.x * w), int(lm.y * h))
+
+                # 1. Draw full body skeleton lines (Sleek clinic silver)
+                for start_idx, end_idx in POSE_CONNECTIONS:
+                    if start_idx in pts and end_idx in pts:
+                        cv2.line(image, pts[start_idx], pts[end_idx], (220, 220, 220), 2)
+
+                # 2. Draw standard joint keypoints (Small red markers)
+                for idx, pt in pts.items():
+                    if idx not in [25, 26]:  # Exclude knees from generic dots
+                        cv2.circle(image, pt, 4, (0, 0, 255), cv2.FILLED)
+
+                # 3. Highlight Knee Joints prominently (Vivid Green + Outer Ring)
+                for knee_idx in [25, 26]:
+                    if knee_idx in pts:
+                        cv2.circle(image, pts[knee_idx], 8, (0, 255, 0), cv2.FILLED)
+                        cv2.circle(image, pts[knee_idx], 11, (255, 255, 255), 2)
+
+                # 4. Telemetry Overlay
                 cv2.putText(
                     image, f"Left Knee: {left_angle:.1f} deg", (20, 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
@@ -810,106 +866,88 @@ st.write(
     "before starting the movement assessment."
 )
 
+# Patient mode selection (outside form so dropdown triggers an immediate rerun)
+existing_patients = get_all_patients()
+patient_mode = st.radio(
+    "Patient Registration Type:",
+    ["New Patient", "Existing Patient"],
+    horizontal=True,
+)
+
+selected_pid = None
+default_name = ""
+default_age = 45
+default_sex_idx = 0
+
+if patient_mode == "Existing Patient":
+  if existing_patients:
+    patient_dict = {
+        f"{p[0]} - {p[1]} (Age: {p[2]})": p for p in existing_patients
+    }
+    selected_label = st.selectbox(
+        "Select Existing Patient:", list(patient_dict.keys())
+    )
+    selected_record = patient_dict[selected_label]
+    selected_pid = selected_record[0]
+    default_name = selected_record[1]
+    default_age = int(selected_record[2])
+    default_sex_idx = 1 if selected_record[3] == 1 else 0
+    st.info(f"Selected Patient ID: `{selected_pid}`")
+  else:
+    st.warning(
+        "No existing patients found in database. Please register as New"
+        " Patient."
+    )
+    patient_mode = "New Patient"
+
 with st.form("questionnaire_form"):
 
-    patient_name = st.text_input(
-        "Patient Name",
-        placeholder="Enter patient name"
+  patient_name = st.text_input(
+      "Patient Name",
+      value=default_name,
+      placeholder="Enter patient name",
+      disabled=(patient_mode == "Existing Patient"),
+  )
+
+  col1, col2 = st.columns(2)
+
+  with col1:
+    age = st.number_input(
+        "Age", min_value=18, max_value=100, value=default_age
     )
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-
-        age = st.number_input(
-            "Age",
-            min_value=18,
-            max_value=100,
-            value=45
-        )
-
-        sex = st.selectbox(
-            "Sex",
-            [
-                "Male",
-                "Female",
-                "Other"
-            ]
-        )
-
-        pain = st.slider(
-            "Current knee pain (0–10)",
-            0,
-            10,
-            0
-        )
-
-        pain_duration = st.selectbox(
-            "Pain duration",
-            [
-                "None",
-                "<3 months",
-                "3–12 months",
-                ">1 year"
-            ]
-        )
-
-        morning_stiffness = st.selectbox(
-            "Morning stiffness?",
-            [
-                "No",
-                "Yes"
-            ]
-        )
-
-    with col2:
-
-        stairs_difficulty = st.selectbox(
-            "Difficulty climbing stairs",
-            [
-                "None",
-                "Mild",
-                "Severe"
-            ]
-        )
-
-        walking_difficulty = st.selectbox(
-            "Difficulty walking",
-            [
-                "None",
-                "Mild",
-                "Severe"
-            ]
-        )
-
-        previous_injury = st.selectbox(
-            "Previous knee injury?",
-            [
-                "No",
-                "Yes"
-            ]
-        )
-
-        previous_surgery = st.selectbox(
-            "Previous knee surgery?",
-            [
-                "No",
-                "Yes"
-            ]
-        )
-
-        family_history = st.selectbox(
-            "Family history of osteoarthritis?",
-            [
-                "No",
-                "Yes"
-            ]
-        )
-
-    submitted = st.form_submit_button(
-        "💾 Save Patient & Questionnaire",
-        use_container_width=True
+    sex = st.selectbox(
+        "Sex", ["Male", "Female", "Other"], index=default_sex_idx
     )
+
+    pain = st.slider("Current knee pain (0–10)", 0, 10, 0)
+
+    pain_duration = st.selectbox(
+        "Pain duration", ["None", "<3 months", "3–12 months", ">1 year"]
+    )
+
+    morning_stiffness = st.selectbox("Morning stiffness?", ["No", "Yes"])
+
+  with col2:
+    stairs_difficulty = st.selectbox(
+        "Difficulty climbing stairs", ["None", "Mild", "Severe"]
+    )
+
+    walking_difficulty = st.selectbox(
+        "Difficulty walking", ["None", "Mild", "Severe"]
+    )
+
+    previous_injury = st.selectbox("Previous knee injury?", ["No", "Yes"])
+
+    previous_surgery = st.selectbox("Previous knee surgery?", ["No", "Yes"])
+
+    family_history = st.selectbox(
+        "Family history of osteoarthritis?", ["No", "Yes"]
+    )
+
+  submitted = st.form_submit_button(
+      "💾 Save Patient & Questionnaire", use_container_width=True
+  )
 
 
 # ============================================================
@@ -918,106 +956,76 @@ with st.form("questionnaire_form"):
 
 if submitted:
 
-    if not patient_name.strip():
+  if not patient_name.strip():
+    st.error("❌ Please enter the patient name.")
+  else:
+    sex_num = {"Male": 0, "Female": 1, "Other": 2}[sex]
 
-        st.error(
-            "❌ Please enter the patient name."
-        )
-
+    # Assign or look up permanent Patient ID
+    if patient_mode == "New Patient" or not selected_pid:
+      patient_id = register_patient(
+          name=patient_name.strip(), age=int(age), sex=sex_num
+      )
     else:
+      patient_id = selected_pid
 
-        questionnaire_data = {
+    questionnaire_data = {
+        "patient_id": patient_id,
+        "patient_name": patient_name.strip(),
+        "age": int(age),
+        "sex": sex_num,
+        "pain": int(pain),
+        "pain_duration": {
+            "None": 0,
+            "<3 months": 1,
+            "3–12 months": 2,
+            ">1 year": 3,
+        }[pain_duration],
+        "morning_stiffness": 1 if morning_stiffness == "Yes" else 0,
+        "stairs_difficulty": {"None": 0, "Mild": 1, "Severe": 2}[
+            stairs_difficulty
+        ],
+        "walking_difficulty": {"None": 0, "Mild": 1, "Severe": 2}[
+            walking_difficulty
+        ],
+        "previous_injury": 1 if previous_injury == "Yes" else 0,
+        "previous_surgery": 1 if previous_surgery == "Yes" else 0,
+        "family_history": 1 if family_history == "Yes" else 0,
+    }
 
-            "patient_name":
-                patient_name.strip(),
+    # Save active session buffer for downstream steps
+    pd.DataFrame([questionnaire_data]).to_csv(QUESTIONNAIRE_FILE, index=False)
 
-            "age":
-                int(age),
+    # Persist ID and Name across session states
+    st.session_state.patient_id = patient_id
+    st.session_state.patient_name = patient_name.strip()
+    st.session_state.questionnaire_saved = True
+    st.session_state.visit_logged = False
 
-            "sex":
-                {
-                    "Male": 0,
-                    "Female": 1,
-                    "Other": 2
-                }[sex],
+    # Clear old movement/AI results
+    st.session_state.test_finished = False
+    st.session_state.movement_result = None
+    st.session_state.movement_saved = False
+    st.session_state.screening_done = False
+    st.session_state.screening_result = None
 
-            "pain":
-                int(pain),
-
-            "pain_duration":
-                {
-                    "None": 0,
-                    "<3 months": 1,
-                    "3–12 months": 2,
-                    ">1 year": 3
-                }[pain_duration],
-
-            "morning_stiffness":
-                1 if morning_stiffness == "Yes" else 0,
-
-            "stairs_difficulty":
-                {
-                    "None": 0,
-                    "Mild": 1,
-                    "Severe": 2
-                }[stairs_difficulty],
-
-            "walking_difficulty":
-                {
-                    "None": 0,
-                    "Mild": 1,
-                    "Severe": 2
-                }[walking_difficulty],
-
-            "previous_injury":
-                1 if previous_injury == "Yes" else 0,
-
-            "previous_surgery":
-                1 if previous_surgery == "Yes" else 0,
-
-            "family_history":
-                1 if family_history == "Yes" else 0,
-        }
-
-        pd.DataFrame(
-            [questionnaire_data]
-        ).to_csv(
-            QUESTIONNAIRE_FILE,
-            index=False
-        )
-
-        st.session_state.patient_name = (
-            patient_name.strip()
-        )
-
-        st.session_state.questionnaire_saved = True
-
-        # Clear old movement/AI results.
-        st.session_state.test_finished = False
-        st.session_state.movement_result = None
-        st.session_state.movement_saved = False
-        st.session_state.screening_done = False
-        st.session_state.screening_result = None
-
-        # New WebRTC key.
-        st.session_state.test_id += 1
-
-        st.success(
-            f"✅ Patient '{patient_name.strip()}' "
-            "and questionnaire saved successfully."
-        )
-
-
-if st.session_state.questionnaire_saved:
+    # New WebRTC key
+    st.session_state.test_id += 1
 
     st.success(
-        f"👤 Current Patient: "
-        f"**{st.session_state.patient_name}**"
+        f"✅ Patient '{patient_name.strip()}' (ID: `{patient_id}`) and"
+        " questionnaire saved successfully."
     )
 
 
-st.divider()
+if st.session_state.get("questionnaire_saved", False):
+  current_id = st.session_state.get("patient_id", "N/A")
+  st.success(
+      f"👤 Current Patient: **{st.session_state.patient_name}** | ID:"
+      f" `{current_id}`"
+  )
 
+st.divider()
 
 # ============================================================
 # 2. MOVEMENT ASSESSMENT
@@ -1370,21 +1378,33 @@ elif st.session_state.screening_result is None:
             st.session_state.screening_result = screening
             st.session_state.screening_done = True
 
-            record = model_input.copy()
-            record["patient_name"] = st.session_state.patient_name
-            record["risk"] = risk
-
-            for label, probability in probability_dict.items():
-                record[f"probability_{label.lower()}"] = probability
-
-            record["timestamp"] = pd.Timestamp.now()
-            record.to_csv(
-                SCREENING_FILE,
-                mode="a",
-                header=not SCREENING_FILE.exists(),
-                index=False
+            # Save screening visit to SQLite
+            patient_id = st.session_state.get("patient_id")
+            features_dict = (
+                model_input.iloc[0].to_dict()
+                if isinstance(model_input, pd.DataFrame)
+                else dict(model_input)
             )
 
+            # Fallback registration if session state lost ID
+            if not patient_id:
+              patient_id = register_patient(
+                  name=st.session_state.get("patient_name", "Unknown"),
+                  age=int(features_dict.get("age", 45)),
+                  sex=int(features_dict.get("sex", 0)),
+              )
+              st.session_state.patient_id = patient_id
+
+            if not st.session_state.get("visit_logged", False):
+              log_screening_visit(
+                  patient_id=patient_id,
+                  kinematics=features_dict,
+                  questionnaire=features_dict,
+                  risk=risk,
+                  probabilities=probability_dict,
+                  notes="Automated clinical screening triage",
+              )
+              st.session_state.visit_logged = True
             # Do not call st.rerun() here. The current run continues directly
             # into Step 5, so the result appears immediately.
 
@@ -1535,6 +1555,51 @@ if (
         "and NOT a diagnosis."
     )
 
+# ============================================================
+# LONGITUDINAL PATIENT HISTORY
+# ============================================================
+st.markdown("---")
+st.subheader("📋 Longitudinal Visit History")
+
+current_pid = st.session_state.get("patient_id")
+
+if current_pid:
+  history_df = get_patient_history(current_pid)
+
+  if not history_df.empty:
+    st.caption(
+        f"Showing all recorded screening visits for Patient ID: `{current_pid}`"
+    )
+
+    # Clean display format
+    display_df = history_df.copy()
+    display_df["timestamp"] = pd.to_datetime(display_df["timestamp"]).dt.strftime(
+        "%Y-%m-%d %H:%M"
+    )
+
+    st.dataframe(
+        display_df[[
+            "visit_id",
+            "timestamp",
+            "predicted_risk",
+            "left_rom",
+            "right_rom",
+            "rom_asymmetry",
+            "pain",
+        ]],
+        use_container_width=True,
+    )
+
+    # Plot ROM trajectory if patient has completed multiple checkups
+    if len(history_df) > 1:
+      st.write("**Range of Motion (ROM) Trend Across Visits:**")
+      trend_df = (
+          display_df.sort_values("timestamp")
+          .set_index("timestamp")[["left_rom", "right_rom"]]
+      )
+      st.line_chart(trend_df)
+  else:
+    st.info("No previous screening records found for this patient.")
 
 # ============================================================
 # DISCLAIMER
@@ -1550,14 +1615,11 @@ KneeSense NER is a **prototype research and screening-support system**.
 
 It does **not diagnose osteoarthritis**.
 
-The current machine-learning model was trained using
-**synthetic prototype data**, not a clinically validated
-patient dataset.
 
-Before real-world healthcare deployment, the system requires
-clinician-labeled datasets, clinical validation, larger and
-diverse datasets, bias/fairness evaluation, and appropriate
-medical/regulatory review.
+"OsteoX is a preliminary screening-support system and does not replace diagnostic clinical imaging or specialist consultation. "
+"The machine-learning risk engine is trained on cohort data from the Osteoarthritis Initiative (OAI) incorporating joint kinematics and symptom grading. "
+"Clinical evaluations must be corroborated by a registered medical practitioner."
+
 """
 )
 
