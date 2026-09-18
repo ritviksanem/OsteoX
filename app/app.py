@@ -27,6 +27,18 @@ from mediapipe.tasks.python import vision
 import sys
 from pathlib import Path
 
+from styles import apply_health_theme
+from ui_components import render_header, render_metric_tile, render_risk_card
+
+st.set_page_config(
+    page_title="OsteoX Health",
+    page_icon="🦴",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# Apply global Apple/Samsung Health CSS
+apply_health_theme()
 
 # Add project root to path if needed so scr is importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +47,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scr.db import (
     get_all_patients,
+    get_connection,
     get_patient_history,
     init_db,
     log_screening_visit,
@@ -47,16 +60,6 @@ init_db()
 from PIL import Image
 from scr.xray_inference import predict_xray
 
-
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
-
-st.set_page_config(
-    page_title="KneeSense NER",
-    page_icon="🦵",
-    layout="wide"
-)
 
 #Ensure Session State Tracking
 if "current_patient_id" not in st.session_state:
@@ -114,20 +117,20 @@ for key, value in defaults.items():
 # HEADER
 # ============================================================
 
-st.title("🦵 KneeSense NER")
-st.subheader("AI-Assisted Early Screening for Osteoarthritis Risk Markers")
+render_header(
+    patient_name=st.session_state.get("patient_name"),
+    patient_id=st.session_state.get("patient_id"),
+)
 st.caption("Portable • Offline • AI-assisted • Preliminary screening")
 
 st.markdown(
     """
-KneeSense NER combines **patient symptoms + camera-based pose analysis +
-movement symmetry** to produce a **LOW / MODERATE / HIGH preliminary risk
-category**.
 
 > ⚠️ **Research screening prototype**: this system does not provide a definitive diagnosis. 
 >The ML risk model is trained on 8,260 real patient records from the NIH Osteoarthritis Initiative (OAI) dataset for preliminary clinical triage
 """
 )
+
 
 st.divider()
 
@@ -646,96 +649,45 @@ def show_movement_report(result):
     )
 
     # --------------------------------------------------------
-    # Knees
+    # Primary Kinematic Bento Grid
     # --------------------------------------------------------
+    c1, c2, c3 = st.columns(3)
 
-    col1, col2 = st.columns(2)
+    with c1:
+      render_metric_tile(
+          title="Left Knee ROM",
+          value=f"{result['left_rom']:.1f}",
+          unit="°",
+          delta=(
+              f"Avg: {result['left_average_angle']:.1f}° | Consist:"
+              f" {result['left_consistency']:.0f}%"
+          ),
+      )
 
-    with col1:
+    with c2:
+      render_metric_tile(
+          title="Right Knee ROM",
+          value=f"{result['right_rom']:.1f}",
+          unit="°",
+          delta=(
+              f"Avg: {result['right_average_angle']:.1f}° | Consist:"
+              f" {result['right_consistency']:.0f}%"
+          ),
+      )
 
-        st.markdown("### 🦵 Left Knee")
+    with c3:
+      asym = float(result["rom_asymmetry"])
+      asym_status = (
+          "Symmetric (< 5%)" if asym < 5.0 else "Elevated Asymmetry"
+      )
+      render_metric_tile(
+          title="ROM Asymmetry",
+          value=f"{asym:.1f}",
+          unit="%",
+          delta=asym_status,
+      )
 
-        st.metric(
-            "Maximum Angle",
-            f"{result['left_max_angle']:.2f}°"
-        )
-
-        st.metric(
-            "Minimum Angle",
-            f"{result['left_min_angle']:.2f}°"
-        )
-
-        st.metric(
-            "Range of Motion",
-            f"{result['left_rom']:.2f}°"
-        )
-
-        st.metric(
-            "Average Angle",
-            f"{result['left_average_angle']:.2f}°"
-        )
-
-        st.metric(
-            "Consistency",
-            f"{result['left_consistency']:.2f}%"
-        )
-
-    with col2:
-
-        st.markdown("### 🦵 Right Knee")
-
-        st.metric(
-            "Maximum Angle",
-            f"{result['right_max_angle']:.2f}°"
-        )
-
-        st.metric(
-            "Minimum Angle",
-            f"{result['right_min_angle']:.2f}°"
-        )
-
-        st.metric(
-            "Range of Motion",
-            f"{result['right_rom']:.2f}°"
-        )
-
-        st.metric(
-            "Average Angle",
-            f"{result['right_average_angle']:.2f}°"
-        )
-
-        st.metric(
-            "Consistency",
-            f"{result['right_consistency']:.2f}%"
-        )
-
-    st.divider()
-
-    # --------------------------------------------------------
-    # Symmetry
-    # --------------------------------------------------------
-
-    st.markdown("### ⚖️ Movement Symmetry")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(
-            "ROM Asymmetry",
-            f"{result['rom_asymmetry']:.2f}%"
-        )
-
-    with col2:
-        st.metric(
-            "Left Gait Events",
-            result["left_gait_events"]
-        )
-
-    with col3:
-        st.metric(
-            "Right Gait Events",
-            result["right_gait_events"]
-        )
+    st.write("")
 
     # --------------------------------------------------------
     # Gait
@@ -1495,20 +1447,17 @@ if (
     # Native Streamlit components are used instead of raw HTML.
     # This prevents the result from being displayed as a code block.
 
-    with st.container(border=True):
-        _, center, _ = st.columns([1, 2, 1])
+    # --------------------------------------------------------
+    # Apple Health Assessment Card
+    # --------------------------------------------------------
+    prob_val = screening["probabilities"].get(risk, 0.0)
+    conf_score = prob_val * 100.0 if prob_val <= 1.0 else prob_val
 
-        with center:
-            st.markdown(f"# {emoji}")
-            st.markdown(f"## {title}")
-
-            if risk == "LOW":
-                st.success(message)
-            elif risk == "MODERATE":
-                st.warning(message)
-            else:
-                st.error(message)
-
+    render_risk_card(
+        risk_level=risk,
+        confidence=conf_score,
+        recommendation=screening["recommendation"],
+    )
     # Probability
     # --------------------------------------------------------
 
@@ -1544,18 +1493,6 @@ if (
         hide_index=True
     )
 
-    # --------------------------------------------------------
-    # Recommendation
-    # --------------------------------------------------------
-
-    st.markdown(
-        "### 📋 Recommendation"
-    )
-
-    st.info(
-        screening["recommendation"]
-    )
-
     st.warning(
         "⚠️ This is a preliminary screening result "
         "and NOT a diagnosis."
@@ -1569,43 +1506,76 @@ st.subheader("📋 Longitudinal Visit History")
 
 current_pid = st.session_state.get("patient_id")
 
-if current_pid:
-  history_df = get_patient_history(current_pid)
+# View filter: Current patient vs entire clinic database
+history_scope = st.radio(
+    "History View Scope:",
+    ["Active Patient Only", "All Clinic Records"],
+    horizontal=True,
+)
 
-  if not history_df.empty:
-    st.caption(
-        f"Showing all recorded screening visits for Patient ID: `{current_pid}`"
+if history_scope == "All Clinic Records":
+  # Fetch full database history across all patients
+  with get_connection() as conn:
+    history_df = pd.read_sql_query(
+        "SELECT * FROM screening_visits ORDER BY timestamp DESC", conn
+    )
+  st.caption("Displaying all screening sessions recorded across all patients.")
+else:
+  history_df = get_patient_history(current_pid) if current_pid else pd.DataFrame()
+  st.caption(
+      f"Showing records for Active Patient ID: `{current_pid or 'None Selected'}`"
+  )
+
+if not history_df.empty:
+  display_df = history_df.copy()
+  display_df["timestamp"] = pd.to_datetime(display_df["timestamp"]).dt.strftime(
+      "%Y-%m-%d %H:%M"
+  )
+
+  # Format optional X-Ray findings
+  if "xray_finding" in display_df.columns:
+    display_df["xray_finding"] = display_df["xray_finding"].fillna(
+        "Pending / Not Taken"
+    )
+  if "xray_confidence" in display_df.columns:
+    display_df["xray_confidence"] = display_df["xray_confidence"].apply(
+        lambda v: f"{v:.1f}%" if pd.notnull(v) else "-"
     )
 
-    # Clean display format
-    display_df = history_df.copy()
-    display_df["timestamp"] = pd.to_datetime(display_df["timestamp"]).dt.strftime(
-        "%Y-%m-%d %H:%M"
-    )
+  table_columns = [
+      "visit_id",
+      "patient_id",
+      "timestamp",
+      "predicted_risk",
+      "xray_finding",
+      "xray_confidence",
+      "left_rom",
+      "right_rom",
+      "rom_asymmetry",
+      "pain",
+  ]
+  cols_to_render = [c for c in table_columns if c in display_df.columns]
+  st.dataframe(display_df[cols_to_render], use_container_width=True, hide_index=True)
 
-    st.dataframe(
-        display_df[[
-            "visit_id",
-            "timestamp",
-            "predicted_risk",
-            "left_rom",
-            "right_rom",
-            "rom_asymmetry",
-            "pain",
-        ]],
-        use_container_width=True,
-    )
+  # --------------------------------------------------------
+  # Range of Motion Trajectory Chart
+  # --------------------------------------------------------
+  st.markdown("#### 📈 Kinematic ROM Trajectory Across Visits")
 
-    # Plot ROM trajectory if patient has completed multiple checkups
-    if len(history_df) > 1:
-      st.write("**Range of Motion (ROM) Trend Across Visits:**")
-      trend_df = (
-          display_df.sort_values("timestamp")
-          .set_index("timestamp")[["left_rom", "right_rom"]]
-      )
-      st.line_chart(trend_df)
+  if len(history_df) > 1:
+    trend_df = (
+        display_df.sort_values("timestamp")
+        .set_index("timestamp")[["left_rom", "right_rom"]]
+    )
+    st.line_chart(trend_df)
   else:
-    st.info("No previous screening records found for this patient.")
+    st.info(
+        "ℹ️ **Trajectory Graph Requires ≥ 2 Visits:** Only 1 visit is currently recorded "
+        "for this view. Perform a follow-up assessment or select 'Existing Patient' during "
+        "registration to plot the recovery/degeneration curve."
+    )
+else:
+  st.info("No previous screening records found for this selection.")
 
 # ============================================================
 # DISCLAIMER
